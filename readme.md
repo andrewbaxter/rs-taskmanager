@@ -11,7 +11,7 @@ Handles
 
 Use it like
 
-```
+```rust
 let tm = TaskManager::new();
 tm.attach_sigint({
     log2 = logger.clone();
