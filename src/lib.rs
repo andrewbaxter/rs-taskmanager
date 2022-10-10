@@ -62,10 +62,7 @@ impl TaskManager {
     }
 
     /// Attaches to the SIGINT signal, to call terminate when triggered.
-    pub async fn attach_sigint<L: FnOnce(io::Error) + Send + 'static>(
-        &self,
-        signal_error_logger: L,
-    ) {
+    pub fn attach_sigint<L: FnOnce(io::Error) + Send + 'static>(&self, signal_error_logger: L) {
         let tm = self.clone();
         spawn(async move {
             match tm.if_alive(signal::ctrl_c()).await {
@@ -80,6 +77,10 @@ impl TaskManager {
                 None => {}
             };
         });
+    }
+
+    pub async fn until_terminate(&self) {
+        self.0.alive.wait().await;
     }
 
     /// Wraps a future and cancels it if a graceful shutdown is initiated. If the cancel occurs,
