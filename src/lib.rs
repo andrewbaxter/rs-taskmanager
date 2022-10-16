@@ -61,6 +61,22 @@ impl TaskManager {
         tm
     }
 
+    pub fn sub(&self) -> TaskManager {
+        let tm = Self::new();
+        let tm_child = tm.clone();
+        let tm_parent = self.clone();
+        self.task(async move {
+            select! {
+                _ = tm_child.until_terminate() => {},
+                _ = tm_parent.until_terminate() => {
+                    tm_child.terminate();
+                    tm_child.join().await;
+                },
+            };
+        });
+        tm
+    }
+
     /// Attaches to the SIGINT signal, to call terminate when triggered.
     pub fn attach_sigint<L: FnOnce(io::Error) + Send + 'static>(&self, signal_error_logger: L) {
         let tm = self.clone();
