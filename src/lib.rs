@@ -1,10 +1,22 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
     time::Duration,
 };
-
-use futures::{Future, StreamExt};
-use tokio::{io, select, signal, spawn, sync::Notify, time::sleep};
+use futures::{
+    Future,
+    StreamExt,
+};
+use tokio::{
+    io,
+    select,
+    signal,
+    spawn,
+    sync::Notify,
+    time::sleep,
+};
 use waitgroup::WaitGroup;
 
 struct Permanotify_ {
@@ -66,8 +78,9 @@ impl TaskManager {
         let tm_child = tm.clone();
         let tm_parent = self.clone();
         self.task(async move {
-            select! {
-                _ = tm_child.until_terminate() => {},
+            select!{
+                _ = tm_child.until_terminate() => {
+                },
                 _ = tm_parent.until_terminate() => {
                     tm_child.terminate();
                     tm_child.join().await;
@@ -85,36 +98,39 @@ impl TaskManager {
                 Some(r) => match r {
                     Ok(_) => {
                         tm.terminate();
-                    }
+                    },
                     Err(e) => {
                         signal_error_logger(e);
-                    }
+                    },
                 },
-                None => {}
+                None => { },
             };
         });
     }
 
+    /// Wait until graceful shutdown is initiated (doesn't wait for all tasks to finish - use
+    /// join for that).
     pub async fn until_terminate(&self) {
         self.0.alive.wait().await;
     }
 
-    /// Wraps a future and cancels it if a graceful shutdown is initiated. If the cancel occurs,
-    /// returns None, otherwise Some(original future return).
+    /// Wraps a future and cancels it if a graceful shutdown is initiated. If the cancel
+    /// occurs, returns None, otherwise Some(original future return).
     pub async fn if_alive<O, T: Future<Output = O> + Send>(&self, future: T) -> Option<O> {
         let n = self.0.alive.wait();
-        select! {
+
+        select!{
             _ = n => None,
             v = future => Some(v),
         }
     }
 
-    /// Runs a future in the background. Callers should clone the task manager and use `if_alive` for any
-    /// long `.await`s within the future so that the task is aborted if shutdown is initiated.
+    /// Runs a future in the background. Callers should clone the task manager and use`if_alive`
+    ///  for any long `.await`s within the future so that the task is aborted if shutdown is
+    /// initiated.
     pub fn task<T>(&self, future: T)
     where
-        T: Future<Output = ()> + Send + 'static,
-    {
+        T: Future<Output = ()> + Send + 'static {
         let w = self.0.wg.lock().unwrap().as_ref().unwrap().worker();
         spawn(async move {
             let _w = w;
@@ -122,12 +138,12 @@ impl TaskManager {
         });
     }
 
-    /// Calls f with a sleep of period between invocations.  There's no concept of missed invocations.
-    pub fn periodic<F: FnMut() -> T + Send + 'static, T: Future<Output = ()> + Send + 'static>(
-        &self,
-        period: Duration,
-        mut f: F,
-    ) {
+    /// Calls f with a sleep of period between invocations.  There's no concept of missed
+    /// invocations.
+    pub fn periodic<
+        F: FnMut() -> T + Send + 'static,
+        T: Future<Output = ()> + Send + 'static,
+    >(&self, period: Duration, mut f: F) {
         let w = self.0.wg.lock().unwrap().as_ref().unwrap().worker();
         let manager = self.clone();
         spawn(async move {
@@ -135,9 +151,13 @@ impl TaskManager {
             loop {
                 f().await;
                 let n = manager.0.alive.wait();
-                select! {
-                    _ = n => { break; }
-                    _ = sleep(period) => {}
+
+                select!{
+                    _ = n => {
+                        break;
+                    }
+                    _ = sleep(period) => {
+                    }
                 };
             }
         });
@@ -150,11 +170,7 @@ impl TaskManager {
         S: StreamExt<Item = T> + Send + 'static + Unpin,
         Hn: FnMut(T) -> F + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
-    >(
-        &self,
-        mut stream: S,
-        mut handler: Hn,
-    ) {
+    >(&self, mut stream: S, mut handler: Hn) {
         let w = self.0.wg.lock().unwrap().as_ref().unwrap().worker();
         let manager = self.clone();
         spawn(async move {
@@ -164,9 +180,13 @@ impl TaskManager {
                 // https://github.com/rust-lang/rust/issues/63768
                 let n = manager.0.alive.wait();
                 let f = {
-                    let e = select! {
-                        _ = n => { break; }
-                        e = stream.next() => {e }
+                    let e = select!{
+                        _ = n => {
+                            break;
+                        }
+                        e = stream.next() => {
+                            e
+                        }
                     };
                     match e {
                         Some(x) => handler(x),
