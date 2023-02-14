@@ -130,6 +130,7 @@ impl TaskManager {
             let mut sig2 = signal(SignalKind::terminate()).unwrap();
             match tm1.if_alive(select(Box::pin(sig1.recv()), Box::pin(sig2.recv()))).await {
                 Some(_) => {
+                    println!("Got signal, terminating.");
                     tm1.terminate();
                 },
                 None => { },
@@ -299,11 +300,14 @@ impl TaskManager {
             },
             Err(e) => Some(e.into()),
         }).collect::<Vec<TreeError>>();
+        println!("DEBUG join, done waiting on critical tasks");
         let wg = self.0.wg.lock().unwrap().take().unwrap();
+        println!("DEBUG join, waiting on wait group");
         wg.wait().await;
         if !errs.is_empty() {
             return Err(TreeError::Nested(format!("The task manager exited after critical tasks failed"), errs));
         }
+        println!("DEBUG join, done");
         return Ok(())
     }
 }
