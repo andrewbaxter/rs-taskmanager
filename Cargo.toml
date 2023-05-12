@@ -1,7 +1,11 @@
 [package]
-name = "rs-taskmanager"
+name = "taskmanager"
 version = "0.1.0"
 edition = "2021"
+description = "Manage groups of background tasks"
+license = "ISC"
+readme = "readme.md"
+repository = "https://github.com/andrewbaxter/taskmanager"
 
 [dependencies]
 futures = "0.3.26"
