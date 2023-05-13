@@ -4,7 +4,6 @@ use std::{
         Mutex,
     },
     time::Duration,
-    fmt::Display,
 };
 use futures::{
     Future,
@@ -14,6 +13,7 @@ use futures::{
     },
     StreamExt,
 };
+use loga::Log;
 use tokio::{
     select,
     signal::{
@@ -66,51 +66,9 @@ impl Permanotify {
     }
 }
 
-pub enum TreeError {
-    Leaf(String),
-    Nested(String, Vec<TreeError>),
-}
-
-impl TreeError {
-    fn fmt_tree(&self, out: &mut String, indent: usize) {
-        if !out.is_empty() {
-            out.push_str("\n");
-        }
-        if indent > 0 {
-            out.push_str(&"  ".repeat(indent));
-            out.push_str("* ");
-        }
-        match self {
-            TreeError::Leaf(t) => {
-                out.push_str(&t);
-            },
-            TreeError::Nested(t, c) => {
-                out.push_str(&t);
-                for c in c {
-                    c.fmt_tree(out, indent + 1);
-                }
-            },
-        }
-    }
-}
-
-impl Display for TreeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut out = String::new();
-        self.fmt_tree(&mut out, 0);
-        out.fmt(f)
-    }
-}
-
-impl<E: std::error::Error> From<E> for TreeError {
-    fn from(value: E) -> Self {
-        TreeError::Leaf(format!("{:?}", value))
-    }
-}
-
 struct TaskManagerInner {
     alive: Permanotify,
-    critical: Mutex<Option<Vec<JoinHandle<Result<(), TreeError>>>>>,
+    critical: Mutex<Option<Vec<JoinHandle<Result<(), loga::Error>>>>>,
     wg: Mutex<Option<WaitGroup>>,
 }
 
@@ -139,29 +97,31 @@ impl TaskManager {
         tm
     }
 
-    pub fn sub(&self, name: &'static str) -> TaskManager {
+    /// Create a sub-taskmanager, which can be independently terminated but will be
+    /// stopped automatically when the parent task manager is terminated.  The log is
+    /// used to provide context to the the child's join within the parent's management.
+    pub fn sub(&self, log: Log) -> TaskManager {
         let tm = Self::new();
         let tm_child = tm.clone();
         let tm_parent = self.clone();
-        self.critical_task(name, async move {
+        self.critical_task(async move {
             select!{
                 _ = tm_child.until_terminate() => {
                 },
                 _ = tm_parent.until_terminate() => {
                     tm_child.terminate();
-                    tm_child.join().await?;
+                    tm_child.join(log).await?;
                 },
             };
 
-            let r: Result<(), TreeError> = Ok(());
+            let r: Result<(), loga::Error> = Ok(());
             r
         });
         tm
     }
 
-    /// Wait until graceful shutdown is initiated (doesn't wait for all tasks to finish
-    ///
-    /// * use join for that).
+    /// Wait until graceful shutdown is initiated (doesn't wait for all tasks to
+    /// finish; use join for that).
     pub async fn until_terminate(&self) {
         self.0.alive.wait().await;
     }
@@ -180,16 +140,12 @@ impl TaskManager {
     /// Runs a future in the background, and terminates the manager when it exits.
     /// Callers should clone the task manager and use`if_alive` for any long `.await`s
     /// within the future so that the task is aborted if shutdown is initiated.
-    pub fn critical_task<T, E>(&self, name: &'static str, future: T)
+    pub fn critical_task<T, E>(&self, future: T)
     where
-        E: Into<TreeError>,
+        E: Into<loga::Error>,
         T: Future<Output = Result<(), E>> + Send + 'static {
         self.0.critical.lock().unwrap().as_mut().unwrap().push(spawn(async move {
-            future
-                .await
-                .map_err(
-                    |e| TreeError::Nested(format!("Critical task [{}] exited with error", name), vec![e.into()]),
-                )
+            future.await.map_err(|e| loga::errors("Critical task exited with error", vec![e.into()]))
         }));
     }
 
@@ -290,24 +246,25 @@ impl TaskManager {
     }
 
     /// Waits for all internal managed activities to exit. Critical tasks cannot be
-    /// started after this is called.
-    pub async fn join(self) -> Result<(), TreeError> {
+    /// started after this is called.  The log is used to provide context to errors
+    /// while shutting down.
+    pub async fn join(self, log: Log) -> Result<(), loga::Error> {
         let critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
         let errs = join_all(critical_tasks).await.into_iter().filter_map(|r| match r {
             Ok(r) => match r {
                 Ok(_) => None,
                 Err(e) => Some(e),
             },
-            Err(e) => Some(e.into()),
-        }).collect::<Vec<TreeError>>();
-        println!("DEBUG join, done waiting on critical tasks");
+            Err(e) => Some(loga::err!(log, "Critical task panicked", err = e)),
+        }).collect::<Vec<loga::Error>>();
+        loga::log_debug!(log, "Join, done waiting on critical tasks");
         let wg = self.0.wg.lock().unwrap().take().unwrap();
-        println!("DEBUG join, waiting on wait group");
+        loga::log_debug!(log, "Join, done waiting on wait group");
         wg.wait().await;
         if !errs.is_empty() {
-            return Err(TreeError::Nested(format!("The task manager exited after critical tasks failed"), errs));
+            return Err(loga::errors("The task manager exited after critical tasks failed", errs));
         }
-        println!("DEBUG join, done");
+        loga::log_debug!(log, "Join, done");
         return Ok(())
     }
 }

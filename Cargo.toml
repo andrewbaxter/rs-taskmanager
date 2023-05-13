@@ -9,6 +9,7 @@ repository = "https://github.com/andrewbaxter/taskmanager"
 
 [dependencies]
 futures = "0.3.26"
+loga = "0.1.2"
 tokio = { version = "1.25.0", features = [
     "signal",
     "macros",
