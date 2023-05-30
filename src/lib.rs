@@ -10,10 +10,10 @@ use futures::{
     future::{
         select,
         join_all,
+        select_all,
     },
     StreamExt,
 };
-use loga::Log;
 use tokio::{
     select,
     signal::{
@@ -23,51 +23,14 @@ use tokio::{
         },
     },
     spawn,
-    sync::Notify,
     time::sleep,
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use waitgroup::WaitGroup;
 
-struct Permanotify_ {
-    fired: bool,
-    notify: Arc<Notify>,
-}
-
-struct Permanotify(Mutex<Permanotify_>);
-
-impl Permanotify {
-    fn new() -> Permanotify {
-        Permanotify(Mutex::new(Permanotify_ {
-            fired: false,
-            notify: Arc::new(Notify::new()),
-        }))
-    }
-
-    async fn wait(&self) {
-        let p = {
-            let p = self.0.lock().unwrap();
-            if p.fired {
-                return;
-            }
-            p.notify.clone()
-        };
-        p.notified().await
-    }
-
-    fn yes(&self) -> bool {
-        return !self.0.lock().unwrap().fired;
-    }
-
-    fn no(&self) {
-        let mut p = self.0.lock().unwrap();
-        p.fired = true;
-        p.notify.notify_waiters();
-    }
-}
-
 struct TaskManagerInner {
-    alive: Permanotify,
+    alive: CancellationToken,
     critical: Mutex<Option<Vec<JoinHandle<Result<(), loga::Error>>>>>,
     wg: Mutex<Option<WaitGroup>>,
 }
@@ -78,17 +41,17 @@ pub struct TaskManager(Arc<TaskManagerInner>);
 impl TaskManager {
     pub fn new() -> TaskManager {
         let tm = TaskManager(Arc::new(TaskManagerInner {
-            alive: Permanotify::new(),
+            alive: CancellationToken::new(),
             critical: Mutex::new(Some(Vec::new())),
             wg: Mutex::new(Some(WaitGroup::new())),
         }));
         let tm1 = tm.clone();
-        spawn(async move {
-            let mut sig1 = signal(SignalKind::interrupt()).unwrap();
-            let mut sig2 = signal(SignalKind::terminate()).unwrap();
+        let mut sig1 = signal(SignalKind::interrupt()).unwrap();
+        let mut sig2 = signal(SignalKind::terminate()).unwrap();
+        tm.task(async move {
             match tm1.if_alive(select(Box::pin(sig1.recv()), Box::pin(sig2.recv()))).await {
                 Some(_) => {
-                    println!("Got signal, terminating.");
+                    eprintln!("Got signal, terminating.");
                     tm1.terminate();
                 },
                 None => { },
@@ -98,38 +61,25 @@ impl TaskManager {
     }
 
     /// Create a sub-taskmanager, which can be independently terminated but will be
-    /// stopped automatically when the parent task manager is terminated.  The log is
-    /// used to provide context to the the child's join within the parent's management.
-    pub fn sub(&self, log: Log) -> TaskManager {
-        let tm = Self::new();
-        let tm_child = tm.clone();
-        let tm_parent = self.clone();
-        self.critical_task(async move {
-            select!{
-                _ = tm_child.until_terminate() => {
-                },
-                _ = tm_parent.until_terminate() => {
-                    tm_child.terminate();
-                    tm_child.join(log).await?;
-                },
-            };
-
-            let r: Result<(), loga::Error> = Ok(());
-            r
-        });
-        tm
+    /// stopped automatically when the parent task manager is terminated.
+    pub fn sub(&self) -> TaskManager {
+        TaskManager(Arc::new(TaskManagerInner {
+            alive: self.0.alive.child_token(),
+            critical: Mutex::new(Some(Vec::new())),
+            wg: Mutex::new(Some(WaitGroup::new())),
+        }))
     }
 
     /// Wait until graceful shutdown is initiated (doesn't wait for all tasks to
     /// finish; use join for that).
     pub async fn until_terminate(&self) {
-        self.0.alive.wait().await;
+        self.0.alive.cancelled().await;
     }
 
     /// Wraps a future and cancels it if a graceful shutdown is initiated. If the
     /// cancel occurs, returns None, otherwise Some(original future return).
     pub async fn if_alive<O, T: Future<Output = O> + Send>(&self, future: T) -> Option<O> {
-        let n = self.0.alive.wait();
+        let n = self.0.alive.cancelled();
 
         select!{
             _ = n => None,
@@ -145,7 +95,7 @@ impl TaskManager {
         E: Into<loga::Error>,
         T: Future<Output = Result<(), E>> + Send + 'static {
         self.0.critical.lock().unwrap().as_mut().unwrap().push(spawn(async move {
-            future.await.map_err(|e| loga::errors("Critical task exited with error", vec![e.into()]))
+            future.await.map_err(|e| e.into())
         }));
     }
 
@@ -183,7 +133,7 @@ impl TaskManager {
                 };
                 f().await;
                 drop(_w);
-                let n = manager.0.alive.wait();
+                let n = manager.0.alive.cancelled();
 
                 select!{
                     _ = n => {
@@ -210,7 +160,7 @@ impl TaskManager {
             loop {
                 // Convoluted to work around poor rust lifetime analysis
                 // https://github.com/rust-lang/rust/issues/63768
-                let n = manager.0.alive.wait();
+                let n = manager.0.alive.cancelled();
                 let f = {
                     let e = select!{
                         _ = n => {
@@ -237,34 +187,44 @@ impl TaskManager {
 
     /// Initiates a graceful shutdown. Doesn't block.
     pub fn terminate(&self) {
-        self.0.alive.no();
+        self.0.alive.cancel();
     }
 
     /// Check if the task manager has requested shutdown.
     pub fn alive(&self) -> bool {
-        return self.0.alive.yes();
+        return self.0.alive.is_cancelled();
     }
 
     /// Waits for all internal managed activities to exit. Critical tasks cannot be
     /// started after this is called.  The log is used to provide context to errors
     /// while shutting down.
-    pub async fn join(self, log: Log) -> Result<(), loga::Error> {
+    pub async fn join(self) -> Result<(), loga::Error> {
         let critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
-        let errs = join_all(critical_tasks).await.into_iter().filter_map(|r| match r {
-            Ok(r) => match r {
-                Ok(_) => None,
-                Err(e) => Some(e),
-            },
-            Err(e) => Some(loga::err!(log, "Critical task panicked", err = e)),
-        }).collect::<Vec<loga::Error>>();
-        loga::log_debug!(log, "Join, done waiting on critical tasks");
+        let errs;
+        if critical_tasks.is_empty() {
+            self.terminate();
+            errs = vec![];
+        } else {
+            let first_critical_task_res = select_all(critical_tasks).await;
+            self.terminate();
+            errs =
+                vec![first_critical_task_res.0]
+                    .into_iter()
+                    .chain(join_all(first_critical_task_res.2).await.into_iter())
+                    .filter_map(|r| match r {
+                        Ok(r) => match r {
+                            Ok(_) => None,
+                            Err(e) => Some(e),
+                        },
+                        Err(e) => Some(e.into()),
+                    })
+                    .collect::<Vec<loga::Error>>();
+        }
         let wg = self.0.wg.lock().unwrap().take().unwrap();
-        loga::log_debug!(log, "Join, done waiting on wait group");
         wg.wait().await;
         if !errs.is_empty() {
-            return Err(loga::errors("The task manager exited after critical tasks failed", errs));
+            return Err(loga::agg_err("The task manager exited after critical tasks failed", errs));
         }
-        loga::log_debug!(log, "Join, done");
         return Ok(())
     }
 }
