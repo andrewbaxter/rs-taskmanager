@@ -223,7 +223,7 @@ impl TaskManager {
         let wg = self.0.wg.lock().unwrap().take().unwrap();
         wg.wait().await;
         if !errs.is_empty() {
-            return Err(loga::new_agg_err("The task manager exited after critical tasks failed", errs));
+            return Err(loga::agg_err("The task manager exited after critical tasks failed", errs));
         }
         return Ok(())
     }
