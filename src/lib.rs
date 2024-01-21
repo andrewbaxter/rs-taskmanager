@@ -19,6 +19,7 @@ use futures::{
 use loga::{
     ea,
     DebugDisplay,
+    ResultContext,
 };
 use tokio::{
     select,
@@ -111,7 +112,7 @@ impl TaskManager {
             panic!("Task with id {} already running!", id);
         }
         self.0.critical.lock().unwrap().as_mut().unwrap().push(spawn(async move {
-            let out = future.await.map_err(|e| e.into());
+            let out = future.await.context_with("Task exited with error", ea!(id = id));
             task_ids.lock().unwrap().remove(&id);
             return out;
         }));
@@ -227,7 +228,7 @@ impl TaskManager {
     /// Waits for all internal managed activities to exit. Critical tasks cannot be
     /// started after this is called.  The log is used to provide context to errors
     /// while shutting down.
-    pub async fn join<F: loga::Flags>(self, log: loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
+    pub async fn join<F: loga::Flags>(self, log: &loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
         let critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
         let alive_ids = self.0.alive_task_ids.clone();
         let wg = self.0.wg.lock().unwrap().take().unwrap();
