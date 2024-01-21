@@ -4,6 +4,8 @@ use std::{
         Mutex,
     },
     time::Duration,
+    collections::HashSet,
+    pin::pin,
 };
 use futures::{
     Future,
@@ -13,6 +15,10 @@ use futures::{
         select_all,
     },
     StreamExt,
+};
+use loga::{
+    ea,
+    DebugDisplay,
 };
 use tokio::{
     select,
@@ -30,6 +36,8 @@ use tokio_util::sync::CancellationToken;
 use waitgroup::WaitGroup;
 
 struct TaskManagerInner {
+    id_prefix: String,
+    alive_task_ids: Arc<Mutex<HashSet<String>>>,
     alive: CancellationToken,
     critical: Mutex<Option<Vec<JoinHandle<Result<(), loga::Error>>>>>,
     wg: Mutex<Option<WaitGroup>>,
@@ -41,29 +49,43 @@ pub struct TaskManager(Arc<TaskManagerInner>);
 impl TaskManager {
     pub fn new() -> TaskManager {
         let tm = TaskManager(Arc::new(TaskManagerInner {
+            id_prefix: "".to_string(),
+            alive_task_ids: Arc::new(Mutex::new(HashSet::new())),
             alive: CancellationToken::new(),
             critical: Mutex::new(Some(Vec::new())),
             wg: Mutex::new(Some(WaitGroup::new())),
         }));
-        let tm1 = tm.clone();
-        let mut sig1 = signal(SignalKind::interrupt()).unwrap();
-        let mut sig2 = signal(SignalKind::terminate()).unwrap();
-        tm.task(async move {
-            match tm1.if_alive(select(Box::pin(sig1.recv()), Box::pin(sig2.recv()))).await {
-                Some(_) => {
-                    eprintln!("Got signal, terminating.");
-                    tm1.terminate();
-                },
-                None => { },
-            };
+        tm.task("Signals", {
+            let mut sig1 = signal(SignalKind::interrupt()).unwrap();
+            let mut sig2 = signal(SignalKind::terminate()).unwrap();
+            let tm = tm.clone();
+            async move {
+                select!{
+                    _ = select(Box::pin(sig1.recv()), Box::pin(sig2.recv())) => {
+                        eprintln!("Got signal, terminating.");
+                        tm.terminate();
+                    },
+                    _ = tm.until_terminate() =>()
+                }
+            }
         });
         tm
     }
 
+    fn prefix_id(&self, id: impl Into<String>) -> String {
+        if self.0.id_prefix.is_empty() {
+            return id.into();
+        } else {
+            return format!("{}/{}", self.0.id_prefix, id.into());
+        }
+    }
+
     /// Create a sub-taskmanager, which can be independently terminated but will be
     /// stopped automatically when the parent task manager is terminated.
-    pub fn sub(&self) -> TaskManager {
+    pub fn sub(&self, id: impl Into<String>) -> TaskManager {
         TaskManager(Arc::new(TaskManagerInner {
+            id_prefix: self.prefix_id(id),
+            alive_task_ids: Arc::new(Mutex::new(HashSet::new())),
             alive: self.0.alive.child_token(),
             critical: Mutex::new(Some(Vec::new())),
             wg: Mutex::new(Some(WaitGroup::new())),
@@ -76,35 +98,36 @@ impl TaskManager {
         self.0.alive.cancelled().await;
     }
 
-    /// Wraps a future and cancels it if a graceful shutdown is initiated. If the
-    /// cancel occurs, returns None, otherwise Some(original future return).
-    pub async fn if_alive<O, T: Future<Output = O> + Send>(&self, future: T) -> Option<O> {
-        let n = self.0.alive.cancelled();
-
-        select!{
-            _ = n => None,
-            v = future => Some(v),
-        }
-    }
-
     /// Runs a future in the background, and terminates the manager when it exits.
     /// Callers should clone the task manager and use`if_alive` for any long `.await`s
     /// within the future so that the task is aborted if shutdown is initiated.
-    pub fn critical_task<T, E>(&self, future: T)
+    pub fn critical_task<T, E>(&self, id: impl Into<String>, future: T)
     where
         E: Into<loga::Error>,
         T: Future<Output = Result<(), E>> + Send + 'static {
+        let id = self.prefix_id(id);
+        let task_ids = self.0.alive_task_ids.clone();
+        if !task_ids.lock().unwrap().insert(id.clone()) {
+            panic!("Task with id {} already running!", id);
+        }
         self.0.critical.lock().unwrap().as_mut().unwrap().push(spawn(async move {
-            future.await.map_err(|e| e.into())
+            let out = future.await.map_err(|e| e.into());
+            task_ids.lock().unwrap().remove(&id);
+            return out;
         }));
     }
 
     /// Runs a future in the background. Callers should clone the task manager and
     /// use`if_alive` for any long `.await`s within the future so that the task is
     /// aborted if shutdown is initiated.
-    pub fn task<T>(&self, future: T)
+    pub fn task<T>(&self, id: impl Into<String>, future: T)
     where
         T: Future<Output = ()> + Send + 'static {
+        let id = self.prefix_id(id);
+        let task_ids = self.0.alive_task_ids.clone();
+        if !task_ids.lock().unwrap().insert(id.clone()) {
+            panic!("Task with id {} already running!", id);
+        }
         let w = match self.0.wg.lock().unwrap().as_ref() {
             Some(w) => w.worker(),
             None => {
@@ -114,6 +137,7 @@ impl TaskManager {
         spawn(async move {
             let _w = w;
             future.await;
+            task_ids.lock().unwrap().remove(&id);
         });
     }
 
@@ -122,21 +146,25 @@ impl TaskManager {
     pub fn periodic<
         F: FnMut() -> T + Send + 'static,
         T: Future<Output = ()> + Send + 'static,
-    >(&self, period: Duration, mut f: F) {
-        let tm0 = self.clone();
-        let manager = self.clone();
+    >(&self, id: impl Into<String>, period: Duration, mut f: F) {
+        let id = self.prefix_id(id);
+        let task_ids = self.0.alive_task_ids.clone();
+        let tm = self.clone();
         spawn(async move {
             loop {
-                let _w = match tm0.0.wg.lock().unwrap().as_ref() {
+                let _w = match tm.0.wg.lock().unwrap().as_ref() {
                     Some(w) => w.worker(),
                     None => break,
                 };
+                if !task_ids.lock().unwrap().insert(id.clone()) {
+                    panic!("Task with id {} already running!", id);
+                }
                 f().await;
                 drop(_w);
-                let n = manager.0.alive.cancelled();
+                task_ids.lock().unwrap().remove(&id);
 
                 select!{
-                    _ = n => {
+                    _ = tm.until_terminate() => {
                         break;
                     }
                     _ = sleep(period) => {
@@ -153,8 +181,10 @@ impl TaskManager {
         S: StreamExt<Item = T> + Send + 'static + Unpin,
         Hn: FnMut(T) -> F + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
-    >(&self, mut stream: S, mut handler: Hn) {
-        let tm0 = self.clone();
+    >(&self, id: impl Into<String>, mut stream: S, mut handler: Hn) {
+        let id = self.prefix_id(id);
+        let task_ids = self.0.alive_task_ids.clone();
+        let tm = self.clone();
         let manager = self.clone();
         spawn(async move {
             loop {
@@ -175,12 +205,16 @@ impl TaskManager {
                         None => break,
                     }
                 };
-                let _w = match tm0.0.wg.lock().unwrap().as_ref() {
+                let _w = match tm.0.wg.lock().unwrap().as_ref() {
                     Some(w) => w.worker(),
                     None => break,
                 };
+                if !task_ids.lock().unwrap().insert(id.clone()) {
+                    panic!("Task with id {} already running!", id);
+                }
                 f.await;
                 drop(_w);
+                task_ids.lock().unwrap().remove(&id);
             }
         });
     }
@@ -190,38 +224,64 @@ impl TaskManager {
         self.0.alive.cancel();
     }
 
-    /// Check if the task manager has requested shutdown.
-    pub fn alive(&self) -> bool {
-        return self.0.alive.is_cancelled();
-    }
-
     /// Waits for all internal managed activities to exit. Critical tasks cannot be
     /// started after this is called.  The log is used to provide context to errors
     /// while shutting down.
-    pub async fn join(self) -> Result<(), loga::Error> {
+    pub async fn join<F: loga::Flags>(self, log: loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
         let critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
+        let alive_ids = self.0.alive_task_ids.clone();
+        let wg = self.0.wg.lock().unwrap().take().unwrap();
         let errs;
         if critical_tasks.is_empty() {
             self.terminate();
-            errs = vec![];
+            let mut work = pin!(async move {
+                wg.wait().await;
+                return vec![];
+            });
+            errs = loop {
+                select!{
+                    errs =& mut work => break errs,
+                    _ = sleep(std::time::Duration::from_secs(10)) => {
+                        log.log_with(
+                            log_flag,
+                            "Waiting for all tasks to finish",
+                            ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
+                        );
+                    }
+                }
+            };
         } else {
             let first_critical_task_res = select_all(critical_tasks).await;
             self.terminate();
-            errs =
-                vec![first_critical_task_res.0]
-                    .into_iter()
-                    .chain(join_all(first_critical_task_res.2).await.into_iter())
-                    .filter_map(|r| match r {
-                        Ok(r) => match r {
-                            Ok(_) => None,
-                            Err(e) => Some(e),
-                        },
-                        Err(e) => Some(e.into()),
-                    })
-                    .collect::<Vec<loga::Error>>();
+            let mut work = pin!(async move {
+                let errs =
+                    vec![first_critical_task_res.0]
+                        .into_iter()
+                        .chain(join_all(first_critical_task_res.2).await.into_iter())
+                        .filter_map(|r| match r {
+                            Ok(r) => match r {
+                                Ok(_) => None,
+                                Err(e) => Some(e),
+                            },
+                            Err(e) => Some(e.into()),
+                        })
+                        .collect::<Vec<loga::Error>>();
+                wg.wait().await;
+                return errs;
+            });
+            errs = loop {
+                select!{
+                    errs =& mut work => break errs,
+                    _ = sleep(std::time::Duration::from_secs(10)) => {
+                        log.log_with(
+                            log_flag,
+                            "Waiting for all tasks to finish",
+                            ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
+                        );
+                    }
+                }
+            };
         }
-        let wg = self.0.wg.lock().unwrap().take().unwrap();
-        wg.wait().await;
         if !errs.is_empty() {
             return Err(loga::agg_err("The task manager exited after critical tasks failed", errs));
         }
