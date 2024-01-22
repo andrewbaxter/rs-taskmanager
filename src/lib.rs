@@ -229,60 +229,47 @@ impl TaskManager {
     /// started after this is called.  The log is used to provide context to errors
     /// while shutting down.
     pub async fn join<F: loga::Flags>(self, log: &loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
-        let critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
         let alive_ids = self.0.alive_task_ids.clone();
-        let wg = self.0.wg.lock().unwrap().take().unwrap();
-        let errs;
-        if critical_tasks.is_empty() {
-            self.terminate();
-            let mut work = pin!(async move {
-                wg.wait().await;
-                return vec![];
-            });
-            errs = loop {
-                select!{
-                    errs =& mut work => break errs,
-                    _ = sleep(std::time::Duration::from_secs(10)) => {
-                        log.log_with(
-                            log_flag,
-                            "Waiting for all tasks to finish",
-                            ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
-                        );
-                    }
-                }
-            };
-        } else {
-            let first_critical_task_res = select_all(critical_tasks).await;
-            self.terminate();
-            let mut work = pin!(async move {
-                let errs =
-                    vec![first_critical_task_res.0]
-                        .into_iter()
-                        .chain(join_all(first_critical_task_res.2).await.into_iter())
-                        .filter_map(|r| match r {
-                            Ok(r) => match r {
-                                Ok(_) => None,
-                                Err(e) => Some(e),
-                            },
-                            Err(e) => Some(e.into()),
-                        })
-                        .collect::<Vec<loga::Error>>();
-                wg.wait().await;
-                return errs;
-            });
-            errs = loop {
-                select!{
-                    errs =& mut work => break errs,
-                    _ = sleep(std::time::Duration::from_secs(10)) => {
-                        log.log_with(
-                            log_flag,
-                            "Waiting for all tasks to finish",
-                            ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
-                        );
-                    }
-                }
-            };
+        let mut critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
+        let mut results = vec![];
+
+        // Park until first critical task ends
+        if !critical_tasks.is_empty() {
+            let first_critical_task_res;
+            (first_critical_task_res, _, critical_tasks) = select_all(critical_tasks).await;
+            results.push(first_critical_task_res);
         }
+
+        // Stop the rest
+        let wg = self.0.wg.lock().unwrap().take().unwrap();
+        self.terminate();
+
+        // Wait for everything to finish
+        let mut work = pin!(async move {
+            let results = join_all(critical_tasks).await;
+            wg.wait().await;
+            return results;
+        });
+        let results1 = loop {
+            select!{
+                results =& mut work => break results,
+                _ = sleep(std::time::Duration::from_secs(10)) => {
+                    log.log_with(
+                        log_flag,
+                        "Waiting for all tasks to finish",
+                        ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
+                    );
+                }
+            }
+        };
+        results.extend(results1);
+        let errs = results.into_iter().filter_map(|r| match r {
+            Ok(r) => match r {
+                Ok(_) => None,
+                Err(e) => Some(e),
+            },
+            Err(e) => Some(e.into()),
+        }).collect::<Vec<loga::Error>>();
         if !errs.is_empty() {
             return Err(loga::agg_err("The task manager exited after critical tasks failed", errs));
         }
