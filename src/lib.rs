@@ -228,7 +228,7 @@ impl TaskManager {
     /// Waits for all internal managed activities to exit. Critical tasks cannot be
     /// started after this is called.  The log is used to provide context to errors
     /// while shutting down.
-    pub async fn join<F: loga::Flags>(self, log: &loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
+    pub async fn join<F: loga::Flag>(self, log: &loga::Log<F>, log_flag: F) -> Result<(), loga::Error> {
         let alive_ids = self.0.alive_task_ids.clone();
         let mut critical_tasks = self.0.critical.lock().unwrap().take().unwrap();
         let mut results = vec![];
@@ -255,7 +255,7 @@ impl TaskManager {
                 results =& mut work => break results,
                 _ = sleep(std::time::Duration::from_secs(10)) => {
                     log.log_with(
-                        log_flag,
+                        log_flag.clone(),
                         "Waiting for all tasks to finish",
                         ea!(alive = (*alive_ids.lock().unwrap()).dbg_str()),
                     );
