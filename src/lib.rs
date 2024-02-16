@@ -19,7 +19,6 @@ use futures::{
 use loga::{
     ea,
     DebugDisplay,
-    ResultContext,
 };
 use tokio::{
     select,
@@ -99,31 +98,12 @@ impl TaskManager {
         self.0.alive.cancelled().await;
     }
 
-    /// Runs a future in the background, and terminates the manager when it exits.
-    /// Callers should clone the task manager and use`if_alive` for any long `.await`s
-    /// within the future so that the task is aborted if shutdown is initiated.
-    pub fn critical_task<T, E>(&self, id: impl Into<String>, future: T)
-    where
-        E: Into<loga::Error>,
-        T: Future<Output = Result<(), E>> + Send + 'static {
-        let id = self.prefix_id(id);
-        let task_ids = self.0.alive_task_ids.clone();
-        if !task_ids.lock().unwrap().insert(id.clone()) {
-            panic!("Task with id {} already running!", id);
-        }
-        self.0.critical.lock().unwrap().as_mut().unwrap().push(spawn(async move {
-            let out = future.await.context_with("Task exited with error", ea!(id = id));
-            task_ids.lock().unwrap().remove(&id);
-            return out;
-        }));
-    }
-
-    /// Runs a future in the background. Callers should clone the task manager and
-    /// use`if_alive` for any long `.await`s within the future so that the task is
-    /// aborted if shutdown is initiated.
-    pub fn task<T>(&self, id: impl Into<String>, future: T)
-    where
-        T: Future<Output = ()> + Send + 'static {
+    pub fn task_(
+        &self,
+        critical: bool,
+        id: impl Into<String>,
+        future: impl Future<Output = Result<(), loga::Error>> + Send + 'static,
+    ) {
         let id = self.prefix_id(id);
         let task_ids = self.0.alive_task_ids.clone();
         if !task_ids.lock().unwrap().insert(id.clone()) {
@@ -135,11 +115,36 @@ impl TaskManager {
                 return;
             },
         };
-        spawn(async move {
+        let j = spawn(async move {
             let _w = w;
-            future.await;
+            let res = future.await;
             task_ids.lock().unwrap().remove(&id);
+            return res;
         });
+        if critical {
+            self.0.critical.lock().unwrap().as_mut().unwrap().push(j);
+        }
+    }
+
+    /// Runs a future in the background, and terminates the manager when it exits.
+    /// Callers should clone the task manager and use`if_alive` for any long `.await`s
+    /// within the future so that the task is aborted if shutdown is initiated.
+    pub fn critical_task(
+        &self,
+        id: impl Into<String>,
+        future: impl Future<Output = Result<(), loga::Error>> + Send + 'static,
+    ) {
+        self.task_(true, id, future);
+    }
+
+    /// Runs a future in the background. Callers should clone the task manager and
+    /// use`if_alive` for any long `.await`s within the future so that the task is
+    /// aborted if shutdown is initiated.
+    pub fn task(&self, id: impl Into<String>, future: impl Future<Output = ()> + Send + 'static) {
+        self.task_(false, id, async move {
+            future.await;
+            return Ok(());
+        })
     }
 
     /// Calls f with a sleep of period between invocations.  There's no concept of
@@ -175,6 +180,63 @@ impl TaskManager {
         });
     }
 
+    fn stream_<
+        T,
+        S: StreamExt<Item = T> + Send + 'static + Unpin,
+        Hn: FnMut(T) -> F + Send + 'static,
+        F: Future<Output = Result<(), loga::Error>> + Send + 'static,
+    >(&self, critical: bool, id: impl Into<String>, mut stream: S, mut handler: Hn) {
+        let id = self.prefix_id(id);
+        let task_ids = self.0.alive_task_ids.clone();
+        let tm = self.clone();
+        let join_handle = spawn(async move {
+            return loop {
+                // Convoluted to work around poor rust lifetime analysis
+                // https://github.com/rust-lang/rust/issues/63768
+                let f = {
+                    let e = select!{
+                        _ = tm.until_terminate() => break Ok(()),
+                        e = stream.next() => e,
+                    };
+                    match e {
+                        Some(x) => handler(x),
+                        None => break Ok(()),
+                    }
+                };
+                let _w = match tm.0.wg.lock().unwrap().as_ref() {
+                    Some(w) => w.worker(),
+                    None => break Ok(()),
+                };
+                if !task_ids.lock().unwrap().insert(id.clone()) {
+                    panic!("Task with id {} already running!", id);
+                }
+                let res = f.await;
+                drop(_w);
+                task_ids.lock().unwrap().remove(&id);
+                match res {
+                    Ok(_) => { },
+                    Err(e) => {
+                        break Err(e);
+                    },
+                }
+            };
+        });
+        if critical {
+            self.0.critical.lock().unwrap().as_mut().unwrap().push(join_handle);
+        }
+    }
+
+    /// Calls handler for each element in stream. If the stream ends or the handler
+    /// returns an error, initiates an error exit.
+    pub fn critical_stream<
+        T,
+        S: StreamExt<Item = T> + Send + 'static + Unpin,
+        Hn: FnMut(T) -> F + Send + 'static,
+        F: Future<Output = Result<(), loga::Error>> + Send + 'static,
+    >(&self, id: impl Into<String>, stream: S, handler: Hn) {
+        self.stream_(true, id, stream, handler);
+    }
+
     /// Calls handler for each element in stream, until the stream ends or the graceful
     /// shutdown is initiated.
     pub fn stream<
@@ -182,40 +244,12 @@ impl TaskManager {
         S: StreamExt<Item = T> + Send + 'static + Unpin,
         Hn: FnMut(T) -> F + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
-    >(&self, id: impl Into<String>, mut stream: S, mut handler: Hn) {
-        let id = self.prefix_id(id);
-        let task_ids = self.0.alive_task_ids.clone();
-        let tm = self.clone();
-        let manager = self.clone();
-        spawn(async move {
-            loop {
-                // Convoluted to work around poor rust lifetime analysis
-                // https://github.com/rust-lang/rust/issues/63768
-                let n = manager.0.alive.cancelled();
-                let f = {
-                    let e = select!{
-                        _ = n => {
-                            break;
-                        }
-                        e = stream.next() => {
-                            e
-                        }
-                    };
-                    match e {
-                        Some(x) => handler(x),
-                        None => break,
-                    }
-                };
-                let _w = match tm.0.wg.lock().unwrap().as_ref() {
-                    Some(w) => w.worker(),
-                    None => break,
-                };
-                if !task_ids.lock().unwrap().insert(id.clone()) {
-                    panic!("Task with id {} already running!", id);
-                }
-                f.await;
-                drop(_w);
-                task_ids.lock().unwrap().remove(&id);
+    >(&self, id: impl Into<String>, stream: S, mut handler: Hn) {
+        self.stream_(false, id, stream, move |e| {
+            let t = handler(e);
+            async move {
+                t.await;
+                return Ok(());
             }
         });
     }
