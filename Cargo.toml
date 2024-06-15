@@ -1,6 +1,6 @@
 [package]
 name = "taskmanager"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Manage groups of background tasks"
 license = "ISC"
@@ -9,7 +9,7 @@ repository = "https://github.com/andrewbaxter/taskmanager"
 
 [dependencies]
 futures = "0.3"
-loga = "0.4"
+loga = "0.5"
 tokio = { version = "1", features = ["signal", "macros", "time", "sync", "rt"] }
 waitgroup = "0.1"
 tokio-util = "0.7"
