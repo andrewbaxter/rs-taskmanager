@@ -1,39 +1,40 @@
-use std::{
-    sync::{
-        Arc,
-        Mutex,
+use {
+    futures::{
+        future::{
+            join_all,
+            select,
+            select_all,
+        },
+        Future,
+        StreamExt,
     },
-    time::Duration,
-    collections::HashSet,
-    pin::pin,
-};
-use futures::{
-    Future,
-    future::{
+    loga::{
+        ea,
+        DebugDisplay,
+        ResultContext,
+    },
+    std::{
+        collections::HashSet,
+        pin::pin,
+        sync::{
+            Arc,
+            Mutex,
+        },
+        time::Duration,
+    },
+    tokio::{
         select,
-        join_all,
-        select_all,
-    },
-    StreamExt,
-};
-use loga::{
-    ea,
-    DebugDisplay,
-};
-use tokio::{
-    select,
-    signal::{
-        unix::{
+        signal::unix::{
             signal,
             SignalKind,
         },
+        spawn,
+        task::JoinHandle,
+        time::sleep,
     },
-    spawn,
-    time::sleep,
-    task::JoinHandle,
+    tokio_util::sync::CancellationToken,
+    waitgroup::WaitGroup,
 };
-use tokio_util::sync::CancellationToken;
-use waitgroup::WaitGroup;
 
 struct TaskManagerInner {
     id_prefix: String,
@@ -119,7 +120,7 @@ impl TaskManager {
             let _w = w;
             let res = future.await;
             task_ids.lock().unwrap().remove(&id);
-            return res;
+            return res.context(&format!("Critical task failed: {}", id));
         });
         if critical {
             self.0.critical.lock().unwrap().as_mut().unwrap().push(j);
@@ -168,7 +169,6 @@ impl TaskManager {
                 f().await;
                 drop(_w);
                 task_ids.lock().unwrap().remove(&id);
-
                 select!{
                     _ = tm.until_terminate() => {
                         break;
