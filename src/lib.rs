@@ -120,7 +120,11 @@ impl TaskManager {
             let _w = w;
             let res = future.await;
             task_ids.lock().unwrap().remove(&id);
-            return res.context(&format!("Critical task failed: {}", id));
+            if critical {
+                return res.context(&format!("Critical task failed: {}", id));
+            } else {
+                return res;
+            }
         });
         if critical {
             self.0.critical.lock().unwrap().as_mut().unwrap().push(j);
@@ -213,11 +217,12 @@ impl TaskManager {
                 let res = f.await;
                 drop(_w);
                 task_ids.lock().unwrap().remove(&id);
-                match res {
-                    Ok(_) => { },
-                    Err(e) => {
+                if let Err(e) = res {
+                    if critical {
+                        break Err(e).context(format!("Critical task failed: {}", id));
+                    } else {
                         break Err(e);
-                    },
+                    }
                 }
             };
         });
